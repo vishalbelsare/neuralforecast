@@ -3,7 +3,7 @@
 # %% auto 0
 __all__ = ['GLU', 'StockBlockLayer', 'StemGNN']
 
-# %% ../../nbs/models.stemgnn.ipynb 5
+# %% ../../nbs/models.stemgnn.ipynb 6
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,8 +11,12 @@ import torch.nn.functional as F
 from ..losses.pytorch import MAE
 from ..common._base_multivariate import BaseMultivariate
 
-# %% ../../nbs/models.stemgnn.ipynb 6
+# %% ../../nbs/models.stemgnn.ipynb 7
 class GLU(nn.Module):
+    """
+    GLU
+    """
+
     def __init__(self, input_channel, output_channel):
         super(GLU, self).__init__()
         self.linear_left = nn.Linear(input_channel, output_channel)
@@ -21,8 +25,12 @@ class GLU(nn.Module):
     def forward(self, x):
         return torch.mul(self.linear_left(x), torch.sigmoid(self.linear_right(x)))
 
-# %% ../../nbs/models.stemgnn.ipynb 7
+# %% ../../nbs/models.stemgnn.ipynb 8
 class StockBlockLayer(nn.Module):
+    """
+    StockBlockLayer
+    """
+
     def __init__(self, time_step, unit, multi_layer, stack_cnt=0):
         super(StockBlockLayer, self).__init__()
         self.time_step = time_step
@@ -127,7 +135,7 @@ class StockBlockLayer(nn.Module):
             backcast_source = None
         return forecast, backcast_source
 
-# %% ../../nbs/models.stemgnn.ipynb 8
+# %% ../../nbs/models.stemgnn.ipynb 9
 class StemGNN(BaseMultivariate):
     """StemGNN
 
@@ -158,14 +166,21 @@ class StemGNN(BaseMultivariate):
     `step_size`: int=1, step size between each window of temporal data.<br>
     `scaler_type`: str='robust', type of scaler for temporal inputs normalization see [temporal scalers](https://nixtla.github.io/neuralforecast/common.scalers.html).<br>
     `random_seed`: int, random_seed for pytorch initializer and numpy generators.<br>
-    `num_workers_loader`: int=os.cpu_count(), workers to be used by `TimeSeriesDataLoader`.<br>
     `drop_last_loader`: bool=False, if True `TimeSeriesDataLoader` drops last non-full batch.<br>
     `alias`: str, optional,  Custom name of the model.<br>
+    `optimizer`: Subclass of 'torch.optim.Optimizer', optional, user specified optimizer instead of the default choice (Adam).<br>
+    `optimizer_kwargs`: dict, optional, list of parameters used by the user specified `optimizer`.<br>
+    `lr_scheduler`: Subclass of 'torch.optim.lr_scheduler.LRScheduler', optional, user specified lr_scheduler instead of the default choice (StepLR).<br>
+    `lr_scheduler_kwargs`: dict, optional, list of parameters used by the user specified `lr_scheduler`.<br>
+    `dataloader_kwargs`: dict, optional, list of parameters passed into the PyTorch Lightning dataloader by the `TimeSeriesDataLoader`. <br>
     `**trainer_kwargs`: int,  keyword trainer arguments inherited from [PyTorch Lighning's trainer](https://pytorch-lightning.readthedocs.io/en/stable/api/pytorch_lightning.trainer.trainer.Trainer.html?highlight=trainer).<br>
     """
 
     # Class attributes
     SAMPLING_TYPE = "multivariate"
+    EXOGENOUS_FUTR = False
+    EXOGENOUS_HIST = False
+    EXOGENOUS_STAT = False
 
     def __init__(
         self,
@@ -190,10 +205,15 @@ class StemGNN(BaseMultivariate):
         step_size: int = 1,
         scaler_type: str = "robust",
         random_seed: int = 1,
-        num_workers_loader=0,
         drop_last_loader=False,
+        optimizer=None,
+        optimizer_kwargs=None,
+        lr_scheduler=None,
+        lr_scheduler_kwargs=None,
+        dataloader_kwargs=None,
         **trainer_kwargs
     ):
+
         # Inherit BaseMultivariate class
         super(StemGNN, self).__init__(
             h=h,
@@ -212,16 +232,18 @@ class StemGNN(BaseMultivariate):
             batch_size=batch_size,
             step_size=step_size,
             scaler_type=scaler_type,
-            num_workers_loader=num_workers_loader,
             drop_last_loader=drop_last_loader,
             random_seed=random_seed,
+            optimizer=optimizer,
+            optimizer_kwargs=optimizer_kwargs,
+            lr_scheduler=lr_scheduler,
+            lr_scheduler_kwargs=lr_scheduler_kwargs,
+            dataloader_kwargs=dataloader_kwargs,
             **trainer_kwargs
         )
-
-        # Exogenous variables
-        self.futr_input_size = len(self.futr_exog_list)
-        self.hist_input_size = len(self.hist_exog_list)
-        self.stat_input_size = len(self.stat_exog_list)
+        # Quick fix for now, fix the model later.
+        if n_stacks != 2:
+            raise Exception("StemGNN currently only supports n_stacks=2.")
 
         self.unit = n_series
         self.stack_cnt = n_stacks
@@ -248,7 +270,9 @@ class StemGNN(BaseMultivariate):
         self.fc = nn.Sequential(
             nn.Linear(int(self.time_step), int(self.time_step)),
             nn.LeakyReLU(),
-            nn.Linear(int(self.time_step), self.horizon),
+            nn.Linear(
+                int(self.time_step), self.horizon * self.loss.outputsize_multiplier
+            ),
         )
         self.leakyrelu = nn.LeakyReLU(self.alpha)
         self.dropout = nn.Dropout(p=dropout_rate)
@@ -328,6 +352,7 @@ class StemGNN(BaseMultivariate):
     def forward(self, windows_batch):
         # Parse batch
         x = windows_batch["insample_y"]
+        batch_size = x.shape[0]
 
         mul_L, attention = self.latent_correlation_layer(x)
         X = x.unsqueeze(1).permute(0, 1, 3, 2).contiguous()
@@ -338,7 +363,15 @@ class StemGNN(BaseMultivariate):
         forecast = result[0] + result[1]
         forecast = self.fc(forecast)
 
-        if forecast.size()[-1] == 1:
-            return forecast.unsqueeze(1).squeeze(-1)
+        forecast = forecast.permute(0, 2, 1).contiguous()
+        forecast = forecast.reshape(
+            batch_size, self.h, self.loss.outputsize_multiplier * self.n_series
+        )
+        forecast = self.loss.domain_map(forecast)
+
+        # domain_map might have squeezed the last dimension in case n_series == 1
+        # Note that this fails in case of a tuple loss, but Multivariate does not support tuple losses yet.
+        if forecast.ndim == 2:
+            return forecast.unsqueeze(-1)
         else:
-            return forecast.permute(0, 2, 1).contiguous()
+            return forecast

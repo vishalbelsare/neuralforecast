@@ -25,6 +25,10 @@ from ..losses.pytorch import MAE
 
 # %% ../../nbs/models.informer.ipynb 8
 class ConvLayer(nn.Module):
+    """
+    ConvLayer
+    """
+
     def __init__(self, c_in):
         super(ConvLayer, self).__init__()
         self.downConv = nn.Conv1d(
@@ -48,8 +52,12 @@ class ConvLayer(nn.Module):
 
 # %% ../../nbs/models.informer.ipynb 9
 class ProbMask:
+    """
+    ProbMask
+    """
+
     def __init__(self, B, H, L, index, scores, device="cpu"):
-        _mask = torch.ones(L, scores.shape[-1], dtype=torch.bool).to(device).triu(1)
+        _mask = torch.ones(L, scores.shape[-1], dtype=torch.bool, device=device).triu(1)
         _mask_ex = _mask[None, None, :].expand(B, H, L, scores.shape[-1])
         indicator = _mask_ex[
             torch.arange(B)[:, None, None], torch.arange(H)[None, :, None], index, :
@@ -62,6 +70,10 @@ class ProbMask:
 
 
 class ProbAttention(nn.Module):
+    """
+    ProbAttention
+    """
+
     def __init__(
         self,
         mask_flag=True,
@@ -127,7 +139,9 @@ class ProbAttention(nn.Module):
             torch.arange(B)[:, None, None], torch.arange(H)[None, :, None], index, :
         ] = torch.matmul(attn, V).type_as(context_in)
         if self.output_attention:
-            attns = (torch.ones([B, H, L_V, L_V]) / L_V).type_as(attn).to(attn.device)
+            attns = (torch.ones([B, H, L_V, L_V], device=attn.device) / L_V).type_as(
+                attn
+            )
             attns[
                 torch.arange(B)[:, None, None], torch.arange(H)[None, :, None], index, :
             ] = attn
@@ -135,7 +149,7 @@ class ProbAttention(nn.Module):
         else:
             return (context_in, None)
 
-    def forward(self, queries, keys, values, attn_mask):
+    def forward(self, queries, keys, values, attn_mask, tau=None, delta=None):
         B, L_Q, H, D = queries.shape
         _, L_K, _, _ = keys.shape
 
@@ -209,9 +223,13 @@ class Informer(BaseWindows):
     `start_padding_enabled`: bool=False, if True, the model will pad the time series with zeros at the beginning, by input size.<br>
     `scaler_type`: str='robust', type of scaler for temporal inputs normalization see [temporal scalers](https://nixtla.github.io/neuralforecast/common.scalers.html).<br>
     `random_seed`: int=1, random_seed for pytorch initializer and numpy generators.<br>
-    `num_workers_loader`: int=os.cpu_count(), workers to be used by `TimeSeriesDataLoader`.<br>
     `drop_last_loader`: bool=False, if True `TimeSeriesDataLoader` drops last non-full batch.<br>
     `alias`: str, optional,  Custom name of the model.<br>
+    `optimizer`: Subclass of 'torch.optim.Optimizer', optional, user specified optimizer instead of the default choice (Adam).<br>
+    `optimizer_kwargs`: dict, optional, list of parameters used by the user specified `optimizer`.<br>
+    `lr_scheduler`: Subclass of 'torch.optim.lr_scheduler.LRScheduler', optional, user specified lr_scheduler instead of the default choice (StepLR).<br>
+    `lr_scheduler_kwargs`: dict, optional, list of parameters used by the user specified `lr_scheduler`.<br>
+    `dataloader_kwargs`: dict, optional, list of parameters passed into the PyTorch Lightning dataloader by the `TimeSeriesDataLoader`. <br>
     `**trainer_kwargs`: int,  keyword trainer arguments inherited from [PyTorch Lighning's trainer](https://pytorch-lightning.readthedocs.io/en/stable/api/pytorch_lightning.trainer.trainer.Trainer.html?highlight=trainer).<br>
 
         *References*<br>
@@ -220,6 +238,9 @@ class Informer(BaseWindows):
 
     # Class attributes
     SAMPLING_TYPE = "windows"
+    EXOGENOUS_FUTR = True
+    EXOGENOUS_HIST = False
+    EXOGENOUS_STAT = False
 
     def __init__(
         self,
@@ -254,8 +275,12 @@ class Informer(BaseWindows):
         step_size: int = 1,
         scaler_type: str = "identity",
         random_seed: int = 1,
-        num_workers_loader: int = 0,
         drop_last_loader: bool = False,
+        optimizer=None,
+        optimizer_kwargs=None,
+        lr_scheduler=None,
+        lr_scheduler_kwargs=None,
+        dataloader_kwargs=None,
         **trainer_kwargs,
     ):
         super(Informer, self).__init__(
@@ -279,23 +304,17 @@ class Informer(BaseWindows):
             start_padding_enabled=start_padding_enabled,
             step_size=step_size,
             scaler_type=scaler_type,
-            num_workers_loader=num_workers_loader,
             drop_last_loader=drop_last_loader,
             random_seed=random_seed,
+            optimizer=optimizer,
+            optimizer_kwargs=optimizer_kwargs,
+            lr_scheduler=lr_scheduler,
+            lr_scheduler_kwargs=lr_scheduler_kwargs,
+            dataloader_kwargs=dataloader_kwargs,
             **trainer_kwargs,
         )
 
         # Architecture
-        self.futr_input_size = len(self.futr_exog_list)
-        self.hist_input_size = len(self.hist_exog_list)
-        self.stat_input_size = len(self.stat_exog_list)
-
-        if self.stat_input_size > 0:
-            raise Exception("Informer does not support static variables yet")
-
-        if self.hist_input_size > 0:
-            raise Exception("Informer does not support historical variables yet")
-
         self.label_len = int(np.ceil(input_size * decoder_input_size_multiplier))
         if (self.label_len >= input_size) or (self.label_len <= 0):
             raise Exception(
@@ -313,14 +332,14 @@ class Informer(BaseWindows):
         # Embedding
         self.enc_embedding = DataEmbedding(
             c_in=self.enc_in,
-            exog_input_size=self.hist_input_size,
+            exog_input_size=self.futr_exog_size,
             hidden_size=hidden_size,
             pos_embedding=True,
             dropout=dropout,
         )
         self.dec_embedding = DataEmbedding(
             self.dec_in,
-            exog_input_size=self.hist_input_size,
+            exog_input_size=self.futr_exog_size,
             hidden_size=hidden_size,
             pos_embedding=True,
             dropout=dropout,
@@ -347,9 +366,11 @@ class Informer(BaseWindows):
                 )
                 for l in range(encoder_layers)
             ],
-            [ConvLayer(hidden_size) for l in range(encoder_layers - 1)]
-            if distil
-            else None,
+            (
+                [ConvLayer(hidden_size) for l in range(encoder_layers - 1)]
+                if distil
+                else None
+            ),
             norm_layer=torch.nn.LayerNorm(hidden_size),
         )
         # Decoder
@@ -398,14 +419,14 @@ class Informer(BaseWindows):
 
         insample_y = insample_y.unsqueeze(-1)  # [Ws,L,1]
 
-        if self.futr_input_size > 0:
+        if self.futr_exog_size > 0:
             x_mark_enc = futr_exog[:, : self.input_size, :]
             x_mark_dec = futr_exog[:, -(self.label_len + self.h) :, :]
         else:
             x_mark_enc = None
             x_mark_dec = None
 
-        x_dec = torch.zeros(size=(len(insample_y), self.h, 1)).to(insample_y.device)
+        x_dec = torch.zeros(size=(len(insample_y), self.h, 1), device=insample_y.device)
         x_dec = torch.cat([insample_y[:, -self.label_len :, :], x_dec], dim=1)
 
         enc_out = self.enc_embedding(insample_y, x_mark_enc)

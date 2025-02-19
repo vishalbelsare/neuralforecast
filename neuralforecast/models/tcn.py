@@ -44,14 +44,21 @@ class TCN(BaseRecurrent):
     `val_check_steps`: int=100, Number of training steps between every validation loss check.<br>    `batch_size`: int=32, number of differentseries in each batch.<br>
     `scaler_type`: str='robust', type of scaler for temporal inputs normalization see [temporal scalers](https://nixtla.github.io/neuralforecast/common.scalers.html).<br>
     `random_seed`: int=1, random_seed for pytorch initializer and numpy generators.<br>
-    `num_workers_loader`: int=os.cpu_count(), workers to be used by `TimeSeriesDataLoader`.<br>
     `drop_last_loader`: bool=False, if True `TimeSeriesDataLoader` drops last non-full batch.<br>
     `alias`: str, optional,  Custom name of the model.<br>
+    `optimizer`: Subclass of 'torch.optim.Optimizer', optional, user specified optimizer instead of the default choice (Adam).<br>
+    `optimizer_kwargs`: dict, optional, list of parameters used by the user specified `optimizer`.<br>
+    `lr_scheduler`: Subclass of 'torch.optim.lr_scheduler.LRScheduler', optional, user specified lr_scheduler instead of the default choice (StepLR).<br>
+    `lr_scheduler_kwargs`: dict, optional, list of parameters used by the user specified `lr_scheduler`.<br>
+    `dataloader_kwargs`: dict, optional, list of parameters passed into the PyTorch Lightning dataloader by the `TimeSeriesDataLoader`. <br>
     `**trainer_kwargs`: int,  keyword trainer arguments inherited from [PyTorch Lighning's trainer](https://pytorch-lightning.readthedocs.io/en/stable/api/pytorch_lightning.trainer.trainer.Trainer.html?highlight=trainer).<br>
     """
 
     # Class attributes
     SAMPLING_TYPE = "recurrent"
+    EXOGENOUS_FUTR = True
+    EXOGENOUS_HIST = True
+    EXOGENOUS_STAT = True
 
     def __init__(
         self,
@@ -79,8 +86,12 @@ class TCN(BaseRecurrent):
         valid_batch_size: Optional[int] = None,
         scaler_type: str = "robust",
         random_seed: int = 1,
-        num_workers_loader=0,
         drop_last_loader=False,
+        optimizer=None,
+        optimizer_kwargs=None,
+        lr_scheduler=None,
+        lr_scheduler_kwargs=None,
+        dataloader_kwargs=None,
         **trainer_kwargs
     ):
         super(TCN, self).__init__(
@@ -100,9 +111,13 @@ class TCN(BaseRecurrent):
             futr_exog_list=futr_exog_list,
             hist_exog_list=hist_exog_list,
             stat_exog_list=stat_exog_list,
-            num_workers_loader=num_workers_loader,
             drop_last_loader=drop_last_loader,
             random_seed=random_seed,
+            optimizer=optimizer,
+            optimizer_kwargs=optimizer_kwargs,
+            lr_scheduler=lr_scheduler,
+            lr_scheduler_kwargs=lr_scheduler_kwargs,
+            dataloader_kwargs=dataloader_kwargs,
             **trainer_kwargs
         )
 
@@ -119,10 +134,6 @@ class TCN(BaseRecurrent):
         # MLP decoder
         self.decoder_hidden_size = decoder_hidden_size
         self.decoder_layers = decoder_layers
-
-        self.futr_exog_size = len(self.futr_exog_list)
-        self.hist_exog_size = len(self.hist_exog_list)
-        self.stat_exog_size = len(self.stat_exog_list)
 
         # TCN input size (1 for target variable y)
         input_encoder = 1 + self.hist_exog_size + self.stat_exog_size
@@ -154,6 +165,7 @@ class TCN(BaseRecurrent):
         )
 
     def forward(self, windows_batch):
+
         # Parse windows_batch
         encoder_input = windows_batch["insample_y"]  # [B, seq_len, 1]
         futr_exog = windows_batch["futr_exog"]

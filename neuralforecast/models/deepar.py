@@ -9,12 +9,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-import logging
-import warnings
-
-logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
-warnings.filterwarnings("ignore")
-
 from typing import Optional
 
 from ..common._base_windows import BaseWindows
@@ -60,19 +54,7 @@ class Decoder(nn.Module):
 
 # %% ../../nbs/models.deepar.ipynb 8
 class DeepAR(BaseWindows):
-    """ DeepAR
-
-    The DeepAR model produces probabilistic forecasts based on an autoregressive recurrent neural network optimized on panel data using cross-learning. DeepAR obtains its forecast distribution uses a Markov Chain Monte Carlo sampler with the following conditional probability:
-    $$\mathbb{P}(\mathbf{y}_{[t+1:t+H]}|\;\mathbf{y}_{[:t]},\; \mathbf{x}^{(f)}_{[:t+H]},\; \mathbf{x}^{(s)})$$
-
-    where $\mathbf{x}^{(s)}$ are static exogenous inputs, $\mathbf{x}^{(f)}_{[:t+H]}$ are future exogenous available at the time of the prediction.
-    The predictions are obtained by transforming the hidden states $\mathbf{h}_{t}$ into predictive distribution parameters $\theta_{t}$, and then generating samples $\mathbf{\hat{y}}_{[t+1:t+H]}$ through Monte Carlo sampling trajectories.
-
-    \begin{align}
-    \mathbf{h}_{t} &= \textrm{RNN}([\mathbf{y}_{t},\mathbf{x}^{(f)}_{t+1},\mathbf{x}^{(s)}], \mathbf{h}_{t-1})\\
-    \mathbf{\theta}_{t}&=\textrm{Linear}(\mathbf{h}_{t}) \\
-    \hat{y}_{t+1}&=\textrm{sample}(\;\mathrm{P}(y_{t+1}\;|\;\mathbf{\theta}_{t})\;)
-    \end{align}
+    """DeepAR
 
     **Parameters:**<br>
     `h`: int, Forecast horizon. <br>
@@ -102,10 +84,14 @@ class DeepAR(BaseWindows):
     `step_size`: int=1, step size between each window of temporal data.<br>
     `scaler_type`: str='identity', type of scaler for temporal inputs normalization see [temporal scalers](https://nixtla.github.io/neuralforecast/common.scalers.html).<br>
     `random_seed`: int, random_seed for pytorch initializer and numpy generators.<br>
-    `num_workers_loader`: int=os.cpu_count(), workers to be used by `TimeSeriesDataLoader`.<br>
     `drop_last_loader`: bool=False, if True `TimeSeriesDataLoader` drops last non-full batch.<br>
     `alias`: str, optional,  Custom name of the model.<br>
-    `**trainer_kwargs`: int,  keyword trainer arguments inherited from [PyTorch Lighning's trainer](https://pytorch-lightning.readthedocs.io/en/stable/api/pytorch_lightning.trainer.trainer.Trainer.html?highlight=trainer).<br>    
+    `optimizer`: Subclass of 'torch.optim.Optimizer', optional, user specified optimizer instead of the default choice (Adam).<br>
+    `optimizer_kwargs`: dict, optional, list of parameters used by the user specified `optimizer`.<br>
+    `lr_scheduler`: Subclass of 'torch.optim.lr_scheduler.LRScheduler', optional, user specified lr_scheduler instead of the default choice (StepLR).<br>
+    `lr_scheduler_kwargs`: dict, optional, list of parameters used by the user specified `lr_scheduler`.<br>
+    `dataloader_kwargs`: dict, optional, list of parameters passed into the PyTorch Lightning dataloader by the `TimeSeriesDataLoader`. <br>
+    `**trainer_kwargs`: int,  keyword trainer arguments inherited from [PyTorch Lighning's trainer](https://pytorch-lightning.readthedocs.io/en/stable/api/pytorch_lightning.trainer.trainer.Trainer.html?highlight=trainer).<br>
 
     **References**<br>
     - [David Salinas, Valentin Flunkert, Jan Gasthaus, Tim Januschowski (2020). "DeepAR: Probabilistic forecasting with autoregressive recurrent networks". International Journal of Forecasting.](https://www.sciencedirect.com/science/article/pii/S0169207019301888)<br>
@@ -115,6 +101,9 @@ class DeepAR(BaseWindows):
 
     # Class attributes
     SAMPLING_TYPE = "windows"
+    EXOGENOUS_FUTR = True
+    EXOGENOUS_HIST = False
+    EXOGENOUS_STAT = True
 
     def __init__(
         self,
@@ -147,13 +136,14 @@ class DeepAR(BaseWindows):
         step_size: int = 1,
         scaler_type: str = "identity",
         random_seed: int = 1,
-        num_workers_loader=0,
         drop_last_loader=False,
+        optimizer=None,
+        optimizer_kwargs=None,
+        lr_scheduler=None,
+        lr_scheduler_kwargs=None,
+        dataloader_kwargs=None,
         **trainer_kwargs
     ):
-        # DeepAR does not support historic exogenous variables
-        if hist_exog_list is not None:
-            raise Exception("DeepAR does not support historic exogenous variables.")
 
         if exclude_insample_y:
             raise Exception("DeepAR has no possibility for excluding y.")
@@ -193,9 +183,13 @@ class DeepAR(BaseWindows):
             start_padding_enabled=start_padding_enabled,
             step_size=step_size,
             scaler_type=scaler_type,
-            num_workers_loader=num_workers_loader,
             drop_last_loader=drop_last_loader,
             random_seed=random_seed,
+            optimizer=optimizer,
+            optimizer_kwargs=optimizer_kwargs,
+            lr_scheduler=lr_scheduler,
+            lr_scheduler_kwargs=lr_scheduler_kwargs,
+            dataloader_kwargs=dataloader_kwargs,
             **trainer_kwargs
         )
 
@@ -206,10 +200,6 @@ class DeepAR(BaseWindows):
         self.encoder_n_layers = lstm_n_layers
         self.encoder_hidden_size = lstm_hidden_size
         self.encoder_dropout = lstm_dropout
-
-        self.futr_exog_size = len(self.futr_exog_list)
-        self.hist_exog_size = 0
-        self.stat_exog_size = len(self.stat_exog_list)
 
         # LSTM input size (1 for target variable y)
         input_encoder = 1 + self.futr_exog_size + self.stat_exog_size
@@ -233,18 +223,20 @@ class DeepAR(BaseWindows):
 
     # Override BaseWindows method
     def training_step(self, batch, batch_idx):
+
         # During training h=0
         self.h = 0
+        y_idx = batch["y_idx"]
 
         # Create and normalize windows [Ws, L, C]
         windows = self._create_windows(batch, step="train")
         original_insample_y = windows["temporal"][
-            :, :, 0
+            :, :, y_idx
         ].clone()  # windows: [B, L, Feature] -> [B, L]
         original_insample_y = original_insample_y[
             :, 1:
         ]  # Remove first (shift in DeepAr, cell at t outputs t+1)
-        windows = self._normalization(windows=windows)
+        windows = self._normalization(windows=windows, y_idx=y_idx)
 
         # Parse windows
         insample_y, insample_mask, _, _, _, futr_exog, stat_exog = self._parse_windows(
@@ -257,6 +249,7 @@ class DeepAR(BaseWindows):
             futr_exog=futr_exog,  # [Ws, L+H]
             hist_exog=None,  # None
             stat_exog=stat_exog,
+            y_idx=y_idx,
         )  # [Ws, 1]
 
         # Model Predictions
@@ -264,7 +257,9 @@ class DeepAR(BaseWindows):
 
         if self.loss.is_distribution_output:
             _, y_loc, y_scale = self._inv_normalization(
-                y_hat=original_insample_y, temporal_cols=batch["temporal_cols"]
+                y_hat=original_insample_y,
+                temporal_cols=batch["temporal_cols"],
+                y_idx=y_idx,
             )
             outsample_y = original_insample_y
             distr_args = self.loss.scale_decouple(
@@ -284,13 +279,20 @@ class DeepAR(BaseWindows):
             print("output", torch.isnan(output).sum())
             raise Exception("Loss is NaN, training stopped.")
 
-        self.log("train_loss", loss, prog_bar=True, on_epoch=True)
-        self.train_trajectories.append((self.global_step, float(loss)))
+        self.log(
+            "train_loss",
+            loss.item(),
+            batch_size=outsample_y.size(0),
+            prog_bar=True,
+            on_epoch=True,
+        )
+        self.train_trajectories.append((self.global_step, loss.item()))
 
         self.h = self.horizon_backup  # Restore horizon
         return loss
 
     def validation_step(self, batch, batch_idx):
+
         self.h == self.horizon_backup
 
         if self.val_size == 0:
@@ -299,6 +301,7 @@ class DeepAR(BaseWindows):
         # TODO: Hack to compute number of windows
         windows = self._create_windows(batch, step="val")
         n_windows = len(windows["temporal"])
+        y_idx = batch["y_idx"]
 
         # Number of windows in batch
         windows_batch_size = self.inference_windows_batch_size
@@ -315,18 +318,12 @@ class DeepAR(BaseWindows):
             )
             windows = self._create_windows(batch, step="val", w_idxs=w_idxs)
             original_outsample_y = torch.clone(windows["temporal"][:, -self.h :, 0])
-            windows = self._normalization(windows=windows)
+            windows = self._normalization(windows=windows, y_idx=y_idx)
 
             # Parse windows
-            (
-                insample_y,
-                insample_mask,
-                _,
-                outsample_mask,
-                _,
-                futr_exog,
-                stat_exog,
-            ) = self._parse_windows(batch, windows)
+            insample_y, insample_mask, _, outsample_mask, _, futr_exog, stat_exog = (
+                self._parse_windows(batch, windows)
+            )
             windows_batch = dict(
                 insample_y=insample_y,
                 insample_mask=insample_mask,
@@ -334,6 +331,7 @@ class DeepAR(BaseWindows):
                 hist_exog=None,
                 stat_exog=stat_exog,
                 temporal_cols=batch["temporal_cols"],
+                y_idx=y_idx,
             )
 
             # Model Predictions
@@ -347,22 +345,31 @@ class DeepAR(BaseWindows):
             batch_sizes.append(len(output_batch))
 
         valid_loss = torch.stack(valid_losses)
-        batch_sizes = torch.tensor(batch_sizes).to(valid_loss.device)
-        valid_loss = torch.sum(valid_loss * batch_sizes) / torch.sum(batch_sizes)
+        batch_sizes = torch.tensor(batch_sizes, device=valid_loss.device)
+        batch_size = torch.sum(batch_sizes)
+        valid_loss = torch.sum(valid_loss * batch_sizes) / batch_size
 
         if torch.isnan(valid_loss):
             raise Exception("Loss is NaN, training stopped.")
 
-        self.log("valid_loss", valid_loss, prog_bar=True, on_epoch=True)
+        self.log(
+            "valid_loss",
+            valid_loss.item(),
+            batch_size=batch_size,
+            prog_bar=True,
+            on_epoch=True,
+        )
         self.validation_step_outputs.append(valid_loss)
         return valid_loss
 
     def predict_step(self, batch, batch_idx):
+
         self.h == self.horizon_backup
 
         # TODO: Hack to compute number of windows
         windows = self._create_windows(batch, step="predict")
         n_windows = len(windows["temporal"])
+        y_idx = batch["y_idx"]
 
         # Number of windows in batch
         windows_batch_size = self.inference_windows_batch_size
@@ -377,24 +384,19 @@ class DeepAR(BaseWindows):
                 i * windows_batch_size, min((i + 1) * windows_batch_size, n_windows)
             )
             windows = self._create_windows(batch, step="predict", w_idxs=w_idxs)
-            windows = self._normalization(windows=windows)
+            windows = self._normalization(windows=windows, y_idx=y_idx)
 
             # Parse windows
-            (
-                insample_y,
-                insample_mask,
-                _,
-                _,
-                _,
-                futr_exog,
-                stat_exog,
-            ) = self._parse_windows(batch, windows)
+            insample_y, insample_mask, _, _, _, futr_exog, stat_exog = (
+                self._parse_windows(batch, windows)
+            )
             windows_batch = dict(
                 insample_y=insample_y,  # [Ws, L]
                 insample_mask=insample_mask,  # [Ws, L]
                 futr_exog=futr_exog,  # [Ws, L+H]
                 stat_exog=stat_exog,
                 temporal_cols=batch["temporal_cols"],
+                y_idx=y_idx,
             )
 
             # Model Predictions
@@ -405,6 +407,7 @@ class DeepAR(BaseWindows):
         return y_hat
 
     def train_forward(self, windows_batch):
+
         # Parse windows_batch
         encoder_input = windows_batch["insample_y"][:, :, None]  # <- [B,T,1]
         futr_exog = windows_batch["futr_exog"]
@@ -435,11 +438,12 @@ class DeepAR(BaseWindows):
         return output
 
     def forward(self, windows_batch):
+
         # Parse windows_batch
         encoder_input = windows_batch["insample_y"][:, :, None]  # <- [B,L,1]
         futr_exog = windows_batch["futr_exog"]  # <- [B,L+H, n_f]
         stat_exog = windows_batch["stat_exog"]
-        temporal_cols = windows_batch["temporal_cols"]
+        y_idx = windows_batch["y_idx"]
 
         # [B, seq_len, X]
         batch_size, input_size = encoder_input.shape[:2]
@@ -468,17 +472,17 @@ class DeepAR(BaseWindows):
         )  # [n_layers, B*trajectory_samples, rnn_hidden_state]
 
         # Scales for inverse normalization
-        y_scale = self.scaler.x_scale[:, 0, temporal_cols.get_indexer(["y"])].squeeze(
-            -1
+        y_scale = (
+            self.scaler.x_scale[:, 0, [y_idx]].squeeze(-1).to(encoder_input.device)
         )
-        y_loc = self.scaler.x_shift[:, 0, temporal_cols.get_indexer(["y"])].squeeze(-1)
+        y_loc = self.scaler.x_shift[:, 0, [y_idx]].squeeze(-1).to(encoder_input.device)
         y_scale = torch.repeat_interleave(y_scale, self.trajectory_samples, 0)
         y_loc = torch.repeat_interleave(y_loc, self.trajectory_samples, 0)
 
         # Recursive strategy prediction
         quantiles = self.loss.quantiles.to(encoder_input.device)
-        y_hat = torch.zeros(batch_size, self.h, len(quantiles) + 1).to(
-            encoder_input.device
+        y_hat = torch.zeros(
+            batch_size, self.h, len(quantiles) + 1, device=encoder_input.device
         )
         for tau in range(self.h):
             # Decoder forward

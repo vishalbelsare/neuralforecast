@@ -2,7 +2,7 @@
 
 # %% auto 0
 __all__ = ['SinCosPosEncoding', 'Transpose', 'get_activation_fn', 'PositionalEncoding', 'Coord2dPosEncoding',
-           'Coord1dPosEncoding', 'positional_encoding', 'RevIN', 'PatchTST_backbone', 'Flatten_Head', 'TSTiEncoder',
+           'Coord1dPosEncoding', 'positional_encoding', 'PatchTST_backbone', 'Flatten_Head', 'TSTiEncoder',
            'TSTEncoder', 'TSTEncoderLayer', 'PatchTST']
 
 # %% ../../nbs/models.patchtst.ipynb 5
@@ -15,11 +15,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..common._base_windows import BaseWindows
+from ..common._modules import RevIN
 
 from ..losses.pytorch import MAE
 
 # %% ../../nbs/models.patchtst.ipynb 9
 class Transpose(nn.Module):
+    """
+    Transpose
+    """
+
     def __init__(self, *dims, contiguous=False):
         super().__init__()
         self.dims, self.contiguous = dims, contiguous
@@ -134,70 +139,11 @@ def positional_encoding(pe, learn_pe, q_len, hidden_size):
     return nn.Parameter(W_pos, requires_grad=learn_pe)
 
 # %% ../../nbs/models.patchtst.ipynb 13
-class RevIN(nn.Module):
-    def __init__(self, num_features: int, eps=1e-5, affine=True, subtract_last=False):
-        """
-        :param num_features: the number of features or channels
-        :param eps: a value added for numerical stability
-        :param affine: if True, RevIN has learnable affine parameters
-        """
-        super(RevIN, self).__init__()
-        self.num_features = num_features
-        self.eps = eps
-        self.affine = affine
-        self.subtract_last = subtract_last
-        if self.affine:
-            self._init_params()
-
-    def forward(self, x, mode: str):
-        if mode == "norm":
-            self._get_statistics(x)
-            x = self._normalize(x)
-        elif mode == "denorm":
-            x = self._denormalize(x)
-        else:
-            raise NotImplementedError
-        return x
-
-    def _init_params(self):
-        # initialize RevIN params: (C,)
-        self.affine_weight = nn.Parameter(torch.ones(self.num_features))
-        self.affine_bias = nn.Parameter(torch.zeros(self.num_features))
-
-    def _get_statistics(self, x):
-        dim2reduce = tuple(range(1, x.ndim - 1))
-        if self.subtract_last:
-            self.last = x[:, -1, :].unsqueeze(1)
-        else:
-            self.mean = torch.mean(x, dim=dim2reduce, keepdim=True).detach()
-        self.stdev = torch.sqrt(
-            torch.var(x, dim=dim2reduce, keepdim=True, unbiased=False) + self.eps
-        ).detach()
-
-    def _normalize(self, x):
-        if self.subtract_last:
-            x = x - self.last
-        else:
-            x = x - self.mean
-        x = x / self.stdev
-        if self.affine:
-            x = x * self.affine_weight
-            x = x + self.affine_bias
-        return x
-
-    def _denormalize(self, x):
-        if self.affine:
-            x = x - self.affine_bias
-            x = x / (self.affine_weight + self.eps * self.eps)
-        x = x * self.stdev
-        if self.subtract_last:
-            x = x + self.last
-        else:
-            x = x + self.mean
-        return x
-
-# %% ../../nbs/models.patchtst.ipynb 15
 class PatchTST_backbone(nn.Module):
+    """
+    PatchTST_backbone
+    """
+
     def __init__(
         self,
         c_in: int,
@@ -235,6 +181,7 @@ class PatchTST_backbone(nn.Module):
         affine=True,
         subtract_last=False,
     ):
+
         super().__init__()
 
         # RevIn
@@ -329,6 +276,10 @@ class PatchTST_backbone(nn.Module):
 
 
 class Flatten_Head(nn.Module):
+    """
+    Flatten_Head
+    """
+
     def __init__(self, individual, n_vars, nf, h, c_out, head_dropout=0):
         super().__init__()
 
@@ -366,6 +317,10 @@ class Flatten_Head(nn.Module):
 
 
 class TSTiEncoder(nn.Module):  # i means channel-independent
+    """
+    TSTiEncoder
+    """
+
     def __init__(
         self,
         c_in,
@@ -391,6 +346,7 @@ class TSTiEncoder(nn.Module):  # i means channel-independent
         pe="zeros",
         learn_pe=True,
     ):
+
         super().__init__()
 
         self.patch_num = patch_num
@@ -428,6 +384,7 @@ class TSTiEncoder(nn.Module):  # i means channel-independent
         )
 
     def forward(self, x) -> torch.Tensor:  # x: [bs x nvars x patch_len x patch_num]
+
         n_vars = x.shape[1]
         # Input encoding
         x = x.permute(0, 1, 3, 2)  # x: [bs x nvars x patch_num x patch_len]
@@ -449,6 +406,10 @@ class TSTiEncoder(nn.Module):  # i means channel-independent
 
 
 class TSTEncoder(nn.Module):
+    """
+    TSTEncoder
+    """
+
     def __init__(
         self,
         q_len,
@@ -516,6 +477,10 @@ class TSTEncoder(nn.Module):
 
 
 class TSTEncoderLayer(nn.Module):
+    """
+    TSTEncoderLayer
+    """
+
     def __init__(
         self,
         q_len,
@@ -588,6 +553,7 @@ class TSTEncoderLayer(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
     ):  # -> Tuple[torch.Tensor, Any]:
+
         # Multi-Head attention sublayer
         if self.pre_norm:
             src = self.norm_attn(src)
@@ -633,6 +599,10 @@ class TSTEncoderLayer(nn.Module):
 
 
 class _MultiheadAttention(nn.Module):
+    """
+    _MultiheadAttention
+    """
+
     def __init__(
         self,
         hidden_size,
@@ -686,6 +656,7 @@ class _MultiheadAttention(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
     ):
+
         bs = Q.size(0)
         if K is None:
             K = Q
@@ -813,7 +784,7 @@ class _ScaledDotProductAttention(nn.Module):
         else:
             return output, attn_weights
 
-# %% ../../nbs/models.patchtst.ipynb 17
+# %% ../../nbs/models.patchtst.ipynb 15
 class PatchTST(BaseWindows):
     """PatchTST
 
@@ -838,7 +809,7 @@ class PatchTST(BaseWindows):
     `fc_dropout`: float=0.1, dropout rate for linear layer.<br>
     `head_dropout`: float=0.1, dropout rate for Flatten head layer.<br>
     `attn_dropout`: float=0.1, dropout rate for attention layer.<br>
-    `patch_len`: int=32, length of patch.<br>
+    `patch_len`: int=32, length of patch. Note: patch_len = min(patch_len, input_size + stride).<br>
     `stride`: int=16, stride of patch.<br>
     `revin`: bool=True, bool to use RevIn.<br>
     `revin_affine`: bool=False, bool to use affine in RevIn.<br>
@@ -862,9 +833,13 @@ class PatchTST(BaseWindows):
     `step_size`: int=1, step size between each window of temporal data.<br>
     `scaler_type`: str='identity', type of scaler for temporal inputs normalization see [temporal scalers](https://nixtla.github.io/neuralforecast/common.scalers.html).<br>
     `random_seed`: int, random_seed for pytorch initializer and numpy generators.<br>
-    `num_workers_loader`: int=os.cpu_count(), workers to be used by `TimeSeriesDataLoader`.<br>
     `drop_last_loader`: bool=False, if True `TimeSeriesDataLoader` drops last non-full batch.<br>
     `alias`: str, optional,  Custom name of the model.<br>
+    `optimizer`: Subclass of 'torch.optim.Optimizer', optional, user specified optimizer instead of the default choice (Adam).<br>
+    `optimizer_kwargs`: dict, optional, list of parameters used by the user specified `optimizer`.<br>
+    `lr_scheduler`: Subclass of 'torch.optim.lr_scheduler.LRScheduler', optional, user specified lr_scheduler instead of the default choice (StepLR).<br>
+    `lr_scheduler_kwargs`: dict, optional, list of parameters used by the user specified `lr_scheduler`.<br>
+    `dataloader_kwargs`: dict, optional, list of parameters passed into the PyTorch Lightning dataloader by the `TimeSeriesDataLoader`. <br>
     `**trainer_kwargs`: int,  keyword trainer arguments inherited from [PyTorch Lighning's trainer](https://pytorch-lightning.readthedocs.io/en/stable/api/pytorch_lightning.trainer.trainer.Trainer.html?highlight=trainer).<br>
 
     **References:**<br>
@@ -873,6 +848,9 @@ class PatchTST(BaseWindows):
 
     # Class attributes
     SAMPLING_TYPE = "windows"
+    EXOGENOUS_FUTR = False
+    EXOGENOUS_HIST = False
+    EXOGENOUS_STAT = False
 
     def __init__(
         self,
@@ -914,8 +892,12 @@ class PatchTST(BaseWindows):
         step_size: int = 1,
         scaler_type: str = "identity",
         random_seed: int = 1,
-        num_workers_loader: int = 0,
         drop_last_loader: bool = False,
+        optimizer=None,
+        optimizer_kwargs=None,
+        lr_scheduler=None,
+        lr_scheduler_kwargs=None,
+        dataloader_kwargs=None,
         **trainer_kwargs
     ):
         super(PatchTST, self).__init__(
@@ -939,20 +921,18 @@ class PatchTST(BaseWindows):
             start_padding_enabled=start_padding_enabled,
             step_size=step_size,
             scaler_type=scaler_type,
-            num_workers_loader=num_workers_loader,
             drop_last_loader=drop_last_loader,
             random_seed=random_seed,
+            optimizer=optimizer,
+            optimizer_kwargs=optimizer_kwargs,
+            lr_scheduler=lr_scheduler,
+            lr_scheduler_kwargs=lr_scheduler_kwargs,
+            dataloader_kwargs=dataloader_kwargs,
             **trainer_kwargs
         )
-        # Asserts
-        if stat_exog_list is not None:
-            raise Exception("PatchTST does not yet support static exogenous variables")
-        if futr_exog_list is not None:
-            raise Exception("PatchTST does not yet support future exogenous variables")
-        if hist_exog_list is not None:
-            raise Exception(
-                "PatchTST does not yet support historical exogenous variables"
-            )
+
+        # Enforce correct patch_len, regardless of user input
+        patch_len = min(input_size + stride, patch_len)
 
         c_out = self.loss.outputsize_multiplier
 
@@ -1010,6 +990,7 @@ class PatchTST(BaseWindows):
         )
 
     def forward(self, windows_batch):  # x: [batch, input_size]
+
         # Parse windows_batch
         insample_y = windows_batch["insample_y"]
         # insample_mask = windows_batch['insample_mask']
